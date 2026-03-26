@@ -12,11 +12,11 @@ Quick start
 >>> pal = hv.rosepine.palette("moon")  # list of 20 unique hex colours
 """
 
-from .themes import rosepine, dracula, palenight, _BUNDLED_FONTS
+from .themes import rosepine, dracula, palenight, _BUNDLED_FONTS, reapply
 
 __version__ = "0.1"
 __author__  = "Jahid Hasan"
-__all__ = ["rosepine", "dracula", "palenight"]
+__all__ = ["rosepine", "dracula", "palenight", "reapply"]
 
 
 def info():

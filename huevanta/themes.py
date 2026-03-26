@@ -26,6 +26,93 @@ from matplotlib import font_manager as fm
 # 20 accent slot names — shared by every theme/variant
 _A = [f"a{i}" for i in range(1, 21)]   # ["a1", "a2", ..., "a20"]
 
+# ---------------------------------------------------------------------------
+# Active theme state + auto-persistence hooks
+# ---------------------------------------------------------------------------
+_ACTIVE: dict = {}
+_HOOK_CONNECTED = False
+
+
+def _store_active(theme, variant, font, font_size_base, grid,
+                  font_weight, font_color, label_color, tick_color):
+    _ACTIVE.update(theme=theme, variant=variant, font=font,
+                   font_size_base=font_size_base, grid=grid,
+                   font_weight=font_weight, font_color=font_color,
+                   label_color=label_color, tick_color=tick_color)
+    _connect_hooks()
+
+
+def _get_active_colors():
+    if not _ACTIVE:
+        return None
+    return {"rosepine": _RP, "dracula": _DR, "palenight": _PN}[
+        _ACTIVE["theme"]][_ACTIVE["variant"]]
+
+
+def _connect_hooks():
+    """
+    Patch Figure and Axes creation so every figure/axes made anywhere
+    (including inside seaborn) gets the active theme automatically.
+    """
+    global _HOOK_CONNECTED
+    if _HOOK_CONNECTED:
+        return
+
+    # ── patch Figure.__init__ ────────────────────────────────────────────
+    _orig_fig_init = mpl.figure.Figure.__init__
+
+    def _fig_init(self, *args, **kwargs):
+        _orig_fig_init(self, *args, **kwargs)
+        c = _get_active_colors()
+        if c is not None:
+            self.patch.set_facecolor(c["base"])
+            self.set_facecolor(c["base"])
+
+    mpl.figure.Figure.__init__ = _fig_init
+
+    # ── patch Figure.add_axes and Figure.add_subplot ─────────────────────
+    # seaborn goes through these rather than Axes.__init__ directly
+    _orig_add_axes    = mpl.figure.Figure.add_axes
+    _orig_add_subplot = mpl.figure.Figure.add_subplot
+
+    def _add_axes(self, *args, **kwargs):
+        ax = _orig_add_axes(self, *args, **kwargs)
+        c = _get_active_colors()   # always read fresh — never stale
+        if c is not None:
+            _apply_ax_theme(ax, self, c)
+        return ax
+
+    def _add_subplot(self, *args, **kwargs):
+        ax = _orig_add_subplot(self, *args, **kwargs)
+        c = _get_active_colors()   # always read fresh — never stale
+        if c is not None:
+            _apply_ax_theme(ax, self, c)
+        return ax
+
+    mpl.figure.Figure.add_axes    = _add_axes
+    mpl.figure.Figure.add_subplot = _add_subplot
+
+    _HOOK_CONNECTED = True
+
+
+def reapply():
+    """
+    Re-apply the last Huevanta theme rcParams globally.
+
+    Normally not needed since the auto-hook handles all figure/axes
+    creation. Call this only if a library explicitly resets rcParams::
+
+        hv.reapply()
+    """
+    if not _ACTIVE:
+        raise RuntimeError(
+            "[Huevanta] No theme applied yet. "
+            "Call hv.rosepine.apply() / hv.dracula.apply() / hv.palenight.apply() first."
+        )
+    theme = _ACTIVE["theme"]
+    kw = {k: v for k, v in _ACTIVE.items() if k != "theme"}
+    {"rosepine": rosepine, "dracula": dracula, "palenight": palenight}[theme].apply(**kw)
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -106,16 +193,50 @@ def _apply_ax_theme(ax, fig, c):
     Fixes Jupyter inline backend which ignores rcParams for
     figure background, spine colours and tick label colours.
     """
+    # detect light vs dark theme for visible grid/spine colors
+    _base_r = int(c["base"][1:3], 16)
+    _base_g = int(c["base"][3:5], 16)
+    _base_b = int(c["base"][5:7], 16)
+    _is_light = (_base_r + _base_g + _base_b) > 382
+    _grid_color = c["muted"] if _is_light else c["subtle"]
+
+    # resolve font_color / label_color / tick_color from _ACTIVE
+    def _rc(val, fallback):
+        if val is None:
+            return fallback
+        if val in c:
+            return c[val]
+        return val
+
+    _font_color  = _ACTIVE.get("font_color",  None) if _ACTIVE else None
+    _label_color = _ACTIVE.get("label_color", None) if _ACTIVE else None
+    _tick_color  = _ACTIVE.get("tick_color",  None) if _ACTIVE else None
+
+    _text  = _rc(_font_color,  c["text"])
+    _label = _rc(_label_color, _rc(_font_color, c["subtle"]))
+    _tick  = _rc(_tick_color,  _rc(_font_color, c["subtle"]))
+
     fig.patch.set_facecolor(c["base"])
     ax.set_facecolor(c["surface"])
-    ax.spines["left"].set_color(c["overlay"])
-    ax.spines["bottom"].set_color(c["overlay"])
+    ax.spines["left"].set_color(_grid_color)
+    ax.spines["bottom"].set_color(_grid_color)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.tick_params(colors=c["muted"])
-    ax.xaxis.label.set_color(c["subtle"])
-    ax.yaxis.label.set_color(c["subtle"])
-    ax.title.set_color(c["text"])
+    ax.tick_params(colors=_tick)
+    ax.xaxis.label.set_color(_label)
+    ax.yaxis.label.set_color(_label)
+    ax.title.set_color(_text)
+    # enforce grid exactly as configured — seaborn enables grid by default
+    # which overrides rcParams, so we must set it directly on the axes
+    grid = _ACTIVE.get("grid", False) if _ACTIVE else False
+    if grid is False or grid is None:
+        ax.grid(False)
+    elif grid is True:
+        ax.grid(True, color=_grid_color, linewidth=0.6,
+                linestyle="--", alpha=0.6)
+    elif isinstance(grid, str):
+        ax.grid(True, axis=grid, color=_grid_color,
+                linewidth=0.6, linestyle="--", alpha=0.6)
 
 
 def _build_rc(c, font_family, font_size_base, grid, cmap,
@@ -130,16 +251,32 @@ def _build_rc(c, font_family, font_size_base, grid, cmap,
     tt = round(font_size_base * 1.15)
 
     # resolve colour overrides — fall back to theme colours
-    _text   = font_color  or c["text"]
-    _label  = label_color or font_color or c["subtle"]
-    _tick   = tick_color  or font_color or c["subtle"]
+    # also accept theme key names e.g. "text", "subtle", "a1", "a3" etc.
+    def _resolve_color(val, fallback):
+        if val is None:
+            return fallback
+        if val in c:          # e.g. "text", "muted", "a1", "a5" …
+            return c[val]
+        return val            # assume raw hex string
+
+    _text   = _resolve_color(font_color,  c["text"])
+    _label  = _resolve_color(label_color, _resolve_color(font_color, c["subtle"]))
+    _tick   = _resolve_color(tick_color,  _resolve_color(font_color, c["subtle"]))
+
+    # detect light theme — if base is bright (high R+G+B), use muted for
+    # grid/spines so they're actually visible against the light background
+    _base_r = int(c["base"][1:3], 16)
+    _base_g = int(c["base"][3:5], 16)
+    _base_b = int(c["base"][5:7], 16)
+    _is_light = (_base_r + _base_g + _base_b) > 382  # ~50% brightness threshold
+    _grid_color = c["muted"] if _is_light else c["subtle"]
 
     return {
         "figure.facecolor":      c["base"],
         "figure.edgecolor":      c["base"],
         "figure.dpi":            130,
         "axes.facecolor":        c["surface"],
-        "axes.edgecolor":        c["overlay"],
+        "axes.edgecolor":        _grid_color,
         "axes.labelcolor":       _label,
         "axes.titlecolor":       _text,
         "axes.titlesize":        tt,
@@ -151,7 +288,7 @@ def _build_rc(c, font_family, font_size_base, grid, cmap,
         "axes.grid":             bool(grid),
         "axes.grid.axis":        grid if isinstance(grid, str) else "both",
         "axes.axisbelow":        True,
-        "grid.color":            c["overlay"],
+        "grid.color":            _grid_color,
         "grid.linewidth":        0.6,
         "grid.linestyle":        "--",
         "grid.alpha":            0.6,
@@ -398,7 +535,15 @@ class rosepine:
     def apply(variant="main", font="jetbrains", font_size_base=13, grid=False,
               font_weight="normal", font_color=None, label_color=None, tick_color=None):
         """
-        Apply Rosé Pine theme globally.
+        Apply Rosé Pine theme globally — works for ALL plots including seaborn.
+
+        This is the recommended one-liner for seaborn workflows::
+
+            c = hv.rosepine.apply("dawn")
+            pal = hv.rosepine.palette("dawn")
+            # now just use seaborn/matplotlib normally — theme is global
+            sns.countplot(x='col', data=df, palette=pal)
+            plt.show()
 
         Parameters
         ----------
@@ -417,6 +562,8 @@ class rosepine:
         plt.rcParams.update(_build_rc(c, _resolve_font(font), font_size_base,
                                       grid, "magma", font_weight,
                                       font_color, label_color, tick_color))
+        _store_active("rosepine", variant, font, font_size_base, grid,
+                      font_weight, font_color, label_color, tick_color)
         return c
 
     @staticmethod
@@ -435,18 +582,29 @@ class rosepine:
     @staticmethod
     def figure(variant="main", font="jetbrains", font_size_base=13,
                grid=False, font_weight="normal", font_color=None,
-               label_color=None, tick_color=None, **fig_kwargs):
+               label_color=None, tick_color=None, show=False, **fig_kwargs):
         """
-        One-call themed figure for Jupyter.
-        Returns (colour_dict, fig, ax) — all backgrounds and
-        axis colours are set automatically.
+        One-call themed figure. Returns (colour_dict, fig, ax).
 
-        Usage
-        -----
-        c, fig, ax = hv.rosepine.figure("dawn", figsize=(10, 5))
-        pal = hv.rosepine.palette("dawn")
-        ax.bar(cats, vals, color=pal[:6])
-        plt.show()
+        For seaborn use apply() instead — it sets the theme globally
+        and seaborn picks it up automatically with no blank canvas issue::
+
+            c = hv.rosepine.apply("dawn")
+            pal = hv.rosepine.palette("dawn")
+            sns.countplot(x='col', data=df, palette=pal)
+            plt.title("My chart", color=c['text'])
+            plt.show()
+
+        For pure matplotlib, figure() gives you fig and ax directly::
+
+            c, fig, ax = hv.rosepine.figure("dawn", figsize=(10, 5))
+            pal = hv.rosepine.palette("dawn")
+            ax.bar(cats, vals, color=pal[:6])
+            ax.set_title("My chart", color=c['text'])
+            plt.show()
+
+        show=False (default): no blank canvas in setup cell.
+        show=True: preview the empty styled canvas.
         """
         c = rosepine.apply(variant, font=font, font_size_base=font_size_base,
                            grid=grid, font_weight=font_weight,
@@ -454,6 +612,14 @@ class rosepine:
                            tick_color=tick_color)
         fig, ax = plt.subplots(**fig_kwargs)
         _apply_ax_theme(ax, fig, c)
+        if not show:
+            # Remove from pyplot's display manager so Jupyter won't
+            # render the blank canvas, but fig/ax objects stay fully usable.
+            try:
+                from matplotlib._pylab_helpers import Gcf
+                Gcf.destroy_fig(fig)
+            except Exception:
+                plt.close(fig)
         return c, fig, ax
 
     @staticmethod
@@ -729,6 +895,8 @@ class dracula:
         plt.rcParams.update(_build_rc(c, _resolve_font(font), font_size_base,
                                       grid, "plasma", font_weight,
                                       font_color, label_color, tick_color))
+        _store_active("dracula", variant, font, font_size_base, grid,
+                      font_weight, font_color, label_color, tick_color)
         return c
 
     @staticmethod
@@ -747,14 +915,23 @@ class dracula:
     @staticmethod
     def figure(variant="classic", font="jetbrains", font_size_base=13,
                grid=False, font_weight="normal", font_color=None,
-               label_color=None, tick_color=None, **fig_kwargs):
-        """One-call themed figure. Returns (c, fig, ax)."""
+               label_color=None, tick_color=None, show=False, **fig_kwargs):
+        """One-call themed figure. Returns (c, fig, ax).
+        For seaborn use apply() instead. For pure matplotlib use this.
+        show=False (default): no blank canvas. show=True: preview empty canvas.
+        """
         c = dracula.apply(variant, font=font, font_size_base=font_size_base,
                           grid=grid, font_weight=font_weight,
                           font_color=font_color, label_color=label_color,
                           tick_color=tick_color)
         fig, ax = plt.subplots(**fig_kwargs)
         _apply_ax_theme(ax, fig, c)
+        if not show:
+            try:
+                from matplotlib._pylab_helpers import Gcf
+                Gcf.destroy_fig(fig)
+            except Exception:
+                plt.close(fig)
         return c, fig, ax
 
     @staticmethod
@@ -1020,6 +1197,8 @@ class palenight:
         plt.rcParams.update(_build_rc(c, _resolve_font(font), font_size_base,
                                       grid, "cool", font_weight,
                                       font_color, label_color, tick_color))
+        _store_active("palenight", variant, font, font_size_base, grid,
+                      font_weight, font_color, label_color, tick_color)
         return c
 
     @staticmethod
@@ -1038,14 +1217,23 @@ class palenight:
     @staticmethod
     def figure(variant="default", font="jetbrains", font_size_base=13,
                grid=False, font_weight="normal", font_color=None,
-               label_color=None, tick_color=None, **fig_kwargs):
-        """One-call themed figure. Returns (c, fig, ax)."""
+               label_color=None, tick_color=None, show=False, **fig_kwargs):
+        """One-call themed figure. Returns (c, fig, ax).
+        For seaborn use apply() instead. For pure matplotlib use this.
+        show=False (default): no blank canvas. show=True: preview empty canvas.
+        """
         c = palenight.apply(variant, font=font, font_size_base=font_size_base,
                             grid=grid, font_weight=font_weight,
                             font_color=font_color, label_color=label_color,
                             tick_color=tick_color)
         fig, ax = plt.subplots(**fig_kwargs)
         _apply_ax_theme(ax, fig, c)
+        if not show:
+            try:
+                from matplotlib._pylab_helpers import Gcf
+                Gcf.destroy_fig(fig)
+            except Exception:
+                plt.close(fig)
         return c, fig, ax
 
     @staticmethod
